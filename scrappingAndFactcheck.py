@@ -10,12 +10,16 @@ import json
 from dotenv import load_dotenv
 from datetime import datetime
 import logging
+import random # Import random for proxy selection
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv("key.env")
+
+# Load proxies from environment variable
+PROXIES = os.getenv('PROXIES').split(',') if os.getenv('PROXIES') else []
 
 # Configure Gemini API for this module as well
 genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
@@ -125,10 +129,11 @@ DOMAIN_TRUSTED_WEBSITES = {
 
 # Curated real-time oriented sources (social + news wires + breaking pages)
 REALTIME_SOURCES_GENERAL = [
-    "x.com", "reddit.com",
+    "reddit.com",
     "reuters.com", "apnews.com", "bbc.com", "cnn.com",
     "indianexpress.com", "thehindu.com", "timesofindia.indiatimes.com",
-    "hindustantimes.com", "ndtv.com", "republicworld.com"
+    "hindustantimes.com", "thewire.in", "republicworld.com",
+    "indiatoday.in", "news18.com", "zeenews.india.com"
 ]
 
 REALTIME_SOURCES_FINANCE = [
@@ -139,7 +144,7 @@ REALTIME_SOURCES_FINANCE = [
 REALTIME_SOURCES_HEALTH = [
     "reuters.com", "apnews.com", "bbc.com", "cnn.com",
     # Social signals can surface breaking claims, still included
-    "x.com", "twitter.com", "reddit.com"
+    "reddit.com"
 ]
 
 REALTIME_DOMAIN_SOURCES = {
@@ -220,6 +225,7 @@ async def google_search_and_filter(query, misinformation_domain, max_total_resul
             all_search_items.extend(search_results.get("items"))
         else:
             break
+        await asyncio.sleep(1) # Add a 1-second delay between API calls
 
     logger.info(f"Found {len(all_search_items)} total search results for '{query}'")
 
@@ -276,14 +282,14 @@ async def google_search_realtime(query, misinformation_domain, max_total_results
 
     return filtered_urls
 
-async def scrape_url(session, url):
-    """Scrape content from a single URL without retry logic"""
+async def scrape_url(session, url, proxy=None):
+    """Scrape content from a single URL without retry logic, with optional proxy"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.88 Safari/537.36"
     }
     
     try:
-        async with session.get(url, timeout=10, headers=headers) as response:
+        async with session.get(url, timeout=10, headers=headers, proxy=proxy) as response:
             response.raise_for_status()
             html_content = await response.text()
             soup = BeautifulSoup(html_content, 'html.parser')
@@ -294,6 +300,15 @@ async def scrape_url(session, url):
             if not text_content:
                 text_content = soup.get_text()
             return text_content.strip()
+    except aiohttp.ClientResponseError as e:
+        if e.status == 403:
+            logger.warning(f"Received 403 (Forbidden) for {url}. Skipping this URL.")
+            return None
+        elif e.status == 429:
+            # This case should ideally be handled by async_scrape's retry logic with proxy rotation
+            logger.warning(f"Received 429 (Too Many Requests) for {url}. This should be handled upstream by proxy rotation.")
+            return None # Do not retry within scrape_url for 429
+        logger.warning(f"HTTP error {e.status} fetching {url}: {e}")
     except aiohttp.ClientError as e:
         logger.warning(f"Error fetching {url}: {e}")
     except asyncio.TimeoutError:
@@ -304,12 +319,44 @@ async def scrape_url(session, url):
     return None
 
 async def async_scrape(urls):
-    """Asynchronously scrape multiple URLs"""
+    """Asynchronously scrape multiple URLs using rotating proxies if available"""
     logger.info(f"Scraping {len(urls)} URLs...")
+    scraped_contents = []
+    # If proxies are available, create a rotating list of them
+    if PROXIES:
+        proxy_iterator = iter(random.sample(PROXIES, len(PROXIES)))
+    else:
+        proxy_iterator = iter([]) # Empty iterator if no proxies
+
     async with aiohttp.ClientSession() as session:
-        tasks = [scrape_url(session, url) for url in urls]
-        scraped_contents = await asyncio.gather(*tasks)
-        return [content for content in scraped_contents if content]
+        for url in urls:
+            current_proxy = next(proxy_iterator, None)
+            if PROXIES and current_proxy is None:
+                # If all proxies used, reset the iterator for another round
+                proxy_iterator = iter(random.sample(PROXIES, len(PROXIES)))
+                current_proxy = next(proxy_iterator)
+            
+            try:
+                content = await scrape_url(session, url, proxy=current_proxy)
+                if content:
+                    scraped_contents.append(content)
+            except aiohttp.ClientResponseError as e:
+                if e.status == 429:
+                    logger.warning(f"Received 429 (Too Many Requests) for {url}. Rotating proxy and retrying after delay...")
+                    await asyncio.sleep(random.uniform(5, 15)) # Wait 5-15 seconds before retrying
+                    # Attempt with a new proxy immediately
+                    current_proxy = next(proxy_iterator, None)
+                    if PROXIES and current_proxy is None:
+                        proxy_iterator = iter(random.sample(PROXIES, len(PROXIES)))
+                        current_proxy = next(proxy_iterator)
+                    content = await scrape_url(session, url, proxy=current_proxy)
+                    if content:
+                        scraped_contents.append(content)
+                else:
+                    logger.error(f"HTTP error {e.status} for {url}: {e}")
+            except Exception as e:
+                logger.error(f"Error scraping {url}: {e}")
+    return scraped_contents
 
 async def fact_check_evergreen_misinformation(input_news_text, scraped_data):
     """Compare input news with trusted sources using Gemini"""
@@ -329,12 +376,14 @@ async def fact_check_evergreen_misinformation(input_news_text, scraped_data):
 
     prompt = f"""Given the following original news text and content from trusted sources, analyze if the original news text contains misinformation related to evergreen topics.
     Focus on factual accuracy and consistency with the trusted sources.
+    Specifically, compare the original news text with the content from trusted sources and identify if any part of the original news text is explicitly confirmed, contradicted, or not mentioned.
+    If specific details from the original news are found in the trusted sources, mention which sources confirm those details.
 
     Original News Text: {input_news_text}
 
-    Trusted Sources Content: {combined_trusted_content[:2000]}
+    Trusted Sources Content: {combined_trusted_content[:4000]}
 
-    Based on the comparison, state clearly if the Original News Text is likely 'True', 'Potentially Misleading', or 'False'. Also, provide a brief explanation for your assessment."""
+    Based on the comparison, state clearly if the Original News Text is likely 'True', 'Potentially Misleading', or 'False'. Also, provide a brief explanation for your assessment, referencing the supporting or contradicting sources for key details."""
 
     try:
         response = await model.generate_content_async(prompt)
@@ -358,13 +407,15 @@ async def fact_check_realtime_misinformation(input_news_text, scraped_data):
     )
 
     prompt = f"""Given the following current claim and content scraped from real-time sources (news wires, social feeds, latest articles), assess if the claim is likely true, needs verification, or false.
+    Specifically, compare the claim with the real-time source content and identify if any part of the claim is explicitly confirmed, contradicted, or not mentioned.
+    If specific details from the claim are found in the real-time sources, mention which sources confirm those details.
 
 Claim: {input_news_text}
 
-Real-time Source Content: {combined_trusted_content[:2000]}
+Real-time Source Content: {combined_trusted_content[:4000]}
 
 Be cautious with social media signals; prioritize wire services and reputable outlets.
-Return a concise judgment with reasoning."""
+Return a concise judgment with reasoning, referencing the supporting or contradicting sources for key details."""
 
     try:
         response = await model.generate_content_async(prompt)
@@ -392,7 +443,7 @@ async def summarize_scraped_data_with_gemini(scraped_data):
     prompt = f"""Based on the following content from trusted sources, provide a concise summary of the key information related to the topic.
 
     Trusted Sources Content:
-    {combined_content[:3000]}
+    {combined_content[:4000]}
 
     Summary:"""
 
