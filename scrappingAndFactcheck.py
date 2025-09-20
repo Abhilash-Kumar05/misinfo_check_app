@@ -235,9 +235,11 @@ async def google_search_and_filter(query, misinformation_domain, max_total_resul
         if url:
             for trusted_domain in trusted_domains_list:
                 if trusted_domain in url and url not in filtered_urls:
+                    logger.info(f"Adding trusted URL (Evergreen): {url} (matched {trusted_domain})")
                     filtered_urls.append(url)
                     if len(filtered_urls) >= 5:
                         return filtered_urls
+    logger.info(f"Filtered (Evergreen) {len(filtered_urls)} URLs for query '{query}'")
     return filtered_urls
 
 async def google_search_realtime(query, misinformation_domain, max_total_results=30, num_per_request=10):
@@ -260,10 +262,20 @@ async def google_search_realtime(query, misinformation_domain, max_total_results
     filtered_urls = []
     for item in all_search_items:
         url = item.get("link")
+        title = item.get("title", "").lower()
+        snippet = item.get("snippet", "").lower()
+        
+        # Keywords to look for in title and snippet
+        keywords = query.lower().split()[:5] # Use first 5 words of news_text as keywords
+        if not any(keyword in title or keyword in snippet for keyword in keywords):
+            logger.info(f"Skipping irrelevant search result: {title} - {url}")
+            continue
+
         if not url:
             continue
         for domain in preferred_domains:
             if domain in url and url not in filtered_urls:
+                logger.info(f"Adding preferred real-time URL: {url} (matched {domain})")
                 filtered_urls.append(url)
                 break
         if len(filtered_urls) >= 8:
@@ -271,15 +283,26 @@ async def google_search_realtime(query, misinformation_domain, max_total_results
 
     # Fallback: if not enough, allow any reputable news if present
     if len(filtered_urls) < 3:
+        logger.info(f"Not enough preferred real-time URLs found. Falling back to general news for query '{query}'.")
         for item in all_search_items:
             url = item.get("link")
+            title = item.get("title", "").lower()
+            snippet = item.get("snippet", "").lower()
+            
+            # Apply keyword filter to fallback as well
+            if not any(keyword in title or keyword in snippet for keyword in keywords):
+                logger.info(f"Skipping irrelevant fallback search result: {title} - {url}")
+                continue
+
             if not url or url in filtered_urls:
                 continue
             if any(d in url for d in ["news", "live", "breaking", "latest"]):
+                logger.info(f"Adding fallback real-time URL: {url}")
                 filtered_urls.append(url)
             if len(filtered_urls) >= 8:
                 break
 
+    logger.info(f"Filtered (Real-time) {len(filtered_urls)} URLs for query '{query}'")
     return filtered_urls
 
 async def scrape_url(session, url, proxy=None):
@@ -337,9 +360,13 @@ async def async_scrape(urls):
                 current_proxy = next(proxy_iterator)
             
             try:
+                logger.info(f"Attempting to scrape {url} with proxy: {current_proxy}")
                 content = await scrape_url(session, url, proxy=current_proxy)
                 if content:
                     scraped_contents.append(content)
+                    logger.info(f"Successfully scraped content from {url}. Content length: {len(content)}")
+                else:
+                    logger.warning(f"No content scraped from {url}.")
             except aiohttp.ClientResponseError as e:
                 if e.status == 429:
                     logger.warning(f"Received 429 (Too Many Requests) for {url}. Rotating proxy and retrying after delay...")
@@ -370,24 +397,25 @@ async def fact_check_evergreen_misinformation(input_news_text, scraped_data):
             "temperature": 0.1,
             "top_p": 1,
             "top_k": 1,
-            "max_output_tokens": 300,
+            "max_output_tokens": 500,
         },
     )
 
     prompt = f"""Given the following original news text and content from trusted sources, analyze if the original news text contains misinformation related to evergreen topics.
-    Focus on factual accuracy and consistency with the trusted sources.
-    Specifically, compare the original news text with the content from trusted sources and identify if any part of the original news text is explicitly confirmed, contradicted, or not mentioned.
-    If specific details from the original news are found in the trusted sources, mention which sources confirm those details.
+    Focus on factual accuracy and consistency with the trusted sources. Provide a direct assessment of 'True', 'Potentially Misleading', or 'False' with a concise explanation of 2-3 lines, referencing sources for key confirmations or contradictions.
 
     Original News Text: {input_news_text}
 
-    Trusted Sources Content: {combined_trusted_content[:4000]}
+    Trusted Sources Content: {combined_trusted_content[:8000]}
 
-    Based on the comparison, state clearly if the Original News Text is likely 'True', 'Potentially Misleading', or 'False'. Also, provide a brief explanation for your assessment, referencing the supporting or contradicting sources for key details."""
+    Assessment:"""
 
     try:
         response = await model.generate_content_async(prompt)
         return response.text.strip()
+    except RuntimeError as e:
+        logger.error(f"Event loop error during Gemini fact-check: {e}")
+        return "Fact-checking failed due to an event loop error."
     except Exception as e:
         logger.error(f"Error during Gemini fact-check: {e}")
         return "Fact-checking failed due to an error."
@@ -402,24 +430,25 @@ async def fact_check_realtime_misinformation(input_news_text, scraped_data):
             "temperature": 0.15,
             "top_p": 1,
             "top_k": 1,
-            "max_output_tokens": 300,
+            "max_output_tokens": 500,
         },
     )
 
     prompt = f"""Given the following current claim and content scraped from real-time sources (news wires, social feeds, latest articles), assess if the claim is likely true, needs verification, or false.
-    Specifically, compare the claim with the real-time source content and identify if any part of the claim is explicitly confirmed, contradicted, or not mentioned.
-    If specific details from the claim are found in the real-time sources, mention which sources confirm those details.
+    Specifically, compare the claim with the real-time source content. Provide a direct judgment: 'True', 'Needs Verification', or 'False', with a concise reasoning of 2-3 lines. Prioritize wire services and reputable outlets.
 
 Claim: {input_news_text}
 
-Real-time Source Content: {combined_trusted_content[:4000]}
+Real-time Source Content: {combined_trusted_content[:8000]}
 
-Be cautious with social media signals; prioritize wire services and reputable outlets.
-Return a concise judgment with reasoning, referencing the supporting or contradicting sources for key details."""
+Judgment:"""
 
     try:
         response = await model.generate_content_async(prompt)
         return response.text.strip()
+    except RuntimeError as e:
+        logger.error(f"Event loop error during Gemini real-time fact-check: {e}")
+        return "Real-time fact-checking failed due to an event loop error."
     except Exception as e:
         logger.error(f"Error during Gemini real-time fact-check: {e}")
         return "Real-time fact-checking failed due to an error."
@@ -440,7 +469,7 @@ async def summarize_scraped_data_with_gemini(scraped_data):
         },
     )
 
-    prompt = f"""Based on the following content from trusted sources, provide a concise summary of the key information related to the topic.
+    prompt = f"""Based on the following content from trusted sources, provide a concise and direct summary of the key information related to the topic, keeping the length to a minimum while retaining essential facts.
 
     Trusted Sources Content:
     {combined_content[:4000]}
@@ -450,6 +479,9 @@ async def summarize_scraped_data_with_gemini(scraped_data):
     try:
         response = await model.generate_content_async(prompt)
         return response.text.strip()
+    except RuntimeError as e:
+        logger.error(f"Event loop error during Gemini summarization: {e}")
+        return "Summarization failed due to an event loop error."
     except Exception as e:
         logger.error(f"Error during Gemini summarization: {e}")
         return "Summarization failed due to an error."
@@ -468,13 +500,16 @@ async def generate_further_education(news_text, misinformation_domain):
         },
     )
 
-    prompt = f"""Given the original news topic: "{news_text}" (categorized as {misinformation_domain} misinformation), suggest 3-5 key areas or reputable resources for an individual to further educate themselves to avoid similar misinformation in the future. Focus on critical thinking, media literacy, and understanding the {misinformation_domain} domain.
+    prompt = f"""Given the original news topic: "{news_text}" (categorized as {misinformation_domain} misinformation), suggest 3-5 concise key areas or reputable resources for an individual to further educate themselves to avoid similar misinformation in the future. Focus on critical thinking, media literacy, and understanding the {misinformation_domain} domain. Provide each suggestion on a new line, keeping each point to a single sentence.
 
     Suggestions:"""
 
     try:
         response = await model.generate_content_async(prompt)
         return response.text.strip()
+    except RuntimeError as e:
+        logger.error(f"Event loop error generating further education: {e}")
+        return "Further education suggestions could not be generated due to an event loop error."
     except Exception as e:
         logger.error(f"Error generating further education: {e}")
         return "Further education suggestions could not be generated."
