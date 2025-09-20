@@ -489,7 +489,7 @@ async def summarize_scraped_data_with_gemini(scraped_data: List[str]) -> str:
         "max_output_tokens": 500,
     })
 
-    prompt = f"""Based on the following content from trusted sources, provide a concise and direct summary of the key information related to the topic, keeping the length to a minimum while retaining essential facts.
+    prompt = f"""Based on the following content from trusted sources, provide a concise and direct summary of the key information related to the topic, keeping the length to a maximum 100-150 words while retaining essential facts.
 
     Trusted Sources Content:
     {combined_content[:4000]}
