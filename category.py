@@ -9,6 +9,8 @@ from datetime import datetime
 import uuid
 from functools import wraps
 import logging
+import signal
+import sys
 from dotenv import load_dotenv
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -21,9 +23,6 @@ import google.generativeai as genai
 import requests
 from bs4 import BeautifulSoup
 
-import concurrent.futures  # Add this line
-import psutil  # Add this line
-import threading
 # Import the fact-checking module
 from scrappingAndFactcheck import initialize_fact_checker
 
@@ -49,52 +48,205 @@ os.makedirs(RESULTS_FOLDER, exist_ok=True)
 # Configure Gemini API
 genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
 
-# Global event loop management for production
-_event_loop = None
-_loop_thread = None
+# FIXED EVENT LOOP MANAGEMENT
 _executor = ThreadPoolExecutor(max_workers=10)
-_loop_lock = threading.Lock()
+_shutdown_flag = threading.Event()
 
-def initialize_event_loop():
-    """Initialize a global event loop in a separate thread"""
-    global _event_loop, _loop_thread
+class EventLoopManager:
+    """Manages a persistent event loop for the application lifecycle"""
     
-    with _loop_lock:
-        if _event_loop is not None:
-            return _event_loop
+    def __init__(self):
+        self._loop = None
+        self._thread = None
+        self._lock = threading.RLock()
+        
+    def _run_loop(self):
+        """Run the event loop in a separate thread"""
+        try:
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            logger.info("Event loop started successfully")
             
-        def run_loop():
-            global _event_loop
-            _event_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(_event_loop)
-            logger.info("Global event loop initialized")
-            try:
-                _event_loop.run_forever()
-            except Exception as e:
-                logger.error(f"Event loop error: {e}")
-            finally:
-                _event_loop.close()
-        
-        _loop_thread = threading.Thread(target=run_loop, daemon=True)
-        _loop_thread.start()
-        
-        # Wait for the loop to start
-        timeout = 5
-        start_time = time.time()
-        while _event_loop is None and time.time() - start_time < timeout:
-            time.sleep(0.1)
-        
-        if _event_loop is None:
-            raise RuntimeError("Failed to initialize event loop")
+            # Keep the loop running until shutdown
+            while not _shutdown_flag.is_set():
+                try:
+                    self._loop.run_until_complete(asyncio.sleep(0.1))
+                except Exception as e:
+                    if not _shutdown_flag.is_set():
+                        logger.error(f"Event loop error: {e}")
+                        break
+                        
+        except Exception as e:
+            logger.error(f"Critical event loop error: {e}")
+        finally:
+            if self._loop and not self._loop.is_closed():
+                try:
+                    # Cancel all pending tasks
+                    pending = asyncio.all_tasks(self._loop)
+                    for task in pending:
+                        task.cancel()
+                    
+                    # Wait for tasks to complete
+                    if pending:
+                        self._loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True)
+                        )
+                        
+                    self._loop.close()
+                except Exception as e:
+                    logger.error(f"Error during loop cleanup: {e}")
             
-    return _event_loop
+            logger.info("Event loop thread terminated")
+    
+    def get_loop(self):
+        """Get the managed event loop, creating it if necessary"""
+        with self._lock:
+            if (self._loop is None or 
+                self._loop.is_closed() or 
+                self._thread is None or 
+                not self._thread.is_alive()):
+                
+                logger.info("Initializing new event loop")
+                
+                # Clean up old thread if it exists
+                if self._thread and self._thread.is_alive():
+                    _shutdown_flag.set()
+                    self._thread.join(timeout=5)
+                    _shutdown_flag.clear()
+                
+                # Start new loop thread
+                self._thread = threading.Thread(
+                    target=self._run_loop, 
+                    daemon=False,  # Don't use daemon thread
+                    name="EventLoopThread"
+                )
+                self._thread.start()
+                
+                # Wait for loop to be ready
+                timeout = 10
+                start_time = time.time()
+                while (self._loop is None and 
+                       time.time() - start_time < timeout and
+                       self._thread.is_alive()):
+                    time.sleep(0.1)
+                
+                if self._loop is None:
+                    raise RuntimeError("Failed to initialize event loop within timeout")
+                
+                logger.info("Event loop initialized successfully")
+            
+            return self._loop
+    
+    def shutdown(self):
+        """Shutdown the event loop manager"""
+        with self._lock:
+            logger.info("Shutting down event loop manager...")
+            _shutdown_flag.set()
+            
+            if self._loop and not self._loop.is_closed():
+                try:
+                    # Schedule shutdown in the loop
+                    self._loop.call_soon_threadsafe(self._loop.stop)
+                except:
+                    pass
+            
+            if self._thread and self._thread.is_alive():
+                self._thread.join(timeout=10)
+            
+            self._loop = None
+            self._thread = None
+
+# Global event loop manager instance
+_loop_manager = EventLoopManager()
 
 def get_event_loop():
-    """Get the global event loop"""
-    global _event_loop
-    if _event_loop is None or _event_loop.is_closed():
-        return initialize_event_loop()
-    return _event_loop
+    """Get the global event loop - FIXED VERSION"""
+    try:
+        loop = _loop_manager.get_loop()
+        
+        # Additional health check
+        if loop.is_closed():
+            logger.warning("Loop was closed, reinitializing...")
+            _loop_manager.shutdown()
+            loop = _loop_manager.get_loop()
+        
+        return loop
+    except Exception as e:
+        logger.error(f"Error getting event loop: {e}")
+        # Try to reinitialize
+        _loop_manager.shutdown()
+        return _loop_manager.get_loop()
+
+def get_or_create_event_loop():
+    """Alternative: Create event loop per request thread if needed"""
+    try:
+        # Try to get current loop
+        return asyncio.get_event_loop()
+    except RuntimeError:
+        # No loop in current thread, create one
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
+def async_route(f):
+    """IMPROVED async route decorator with better error handling"""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        try:
+            loop = get_event_loop()
+            
+            # Create a new task in the loop
+            future = asyncio.run_coroutine_threadsafe(f(*args, **kwargs), loop)
+            
+            # Wait for result with timeout
+            return future.result(timeout=300)  # 5 minute timeout
+            
+        except asyncio.TimeoutError:
+            logger.error(f"Request timeout in {f.__name__}")
+            return jsonify({
+                'error': 'Request timeout - processing took too long',
+                'status': 'timeout'
+            }), 408
+            
+        except Exception as e:
+            logger.error(f"Error in async route {f.__name__}: {e}")
+            
+            # Try to recover by reinitializing the loop
+            try:
+                _loop_manager.shutdown()
+                time.sleep(1)
+                loop = get_event_loop()
+                logger.info("Event loop reinitialized after error")
+            except Exception as recovery_error:
+                logger.error(f"Failed to recover event loop: {recovery_error}")
+            
+            return jsonify({
+                'error': f'Processing failed: {str(e)}',
+                'status': 'failed',
+                'details': 'Event loop error - please try again'
+            }), 500
+    
+    return wrapper
+
+def simple_async_route(f):
+    """Simpler alternative that creates loop per request - RECOMMENDED FOR PRODUCTION"""
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        try:
+            # Get or create loop for this thread
+            loop = get_or_create_event_loop()
+            
+            # Run the coroutine
+            return loop.run_until_complete(f(*args, **kwargs))
+            
+        except Exception as e:
+            logger.error(f"Error in simple async route {f.__name__}: {e}")
+            return jsonify({
+                'error': f'Processing failed: {str(e)}',
+                'status': 'failed'
+            }), 500
+    
+    return wrapper
 
 # Thread-safe LanguageTool management
 _language_tool_lock = threading.Lock()
@@ -136,50 +288,6 @@ def get_gemini_model(config=None):
             generation_config=default_config,
         )
     return _local.model
-
-def async_route(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        # Clean up any existing loop references
-        try:
-            asyncio.get_running_loop()
-            # If we're here, there's already a loop running
-            import concurrent.futures
-            
-            def run_async():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    return loop.run_until_complete(f(*args, **kwargs))
-                finally:
-                    # Proper cleanup
-                    pending = asyncio.all_tasks(loop)
-                    for task in pending:
-                        task.cancel()
-                    if pending:
-                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-                    loop.close()
-                    asyncio.set_event_loop(None)
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(run_async)
-                return future.result(timeout=300)  # 5 minute timeout
-                
-        except RuntimeError:
-            # No loop running, safe to create one
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                return loop.run_until_complete(f(*args, **kwargs))
-            finally:
-                pending = asyncio.all_tasks(loop)
-                for task in pending:
-                    task.cancel()
-                if pending:
-                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-                loop.close()
-                asyncio.set_event_loop(None)
-    return wrapper
 
 def process_input_with_beautiful_soup(input_content):
     """Process input content, handling both URLs and text"""
@@ -360,10 +468,6 @@ async def process_single_news_item(news_item):
             'error': f'Processing failed: {str(e)}',
             'status': 'failed'
         }
-    finally:
-        # Force garbage collection for large text processing
-        import gc
-        gc.collect()
 
 # Flask routes
 @app.route('/health', methods=['GET'])
@@ -373,12 +477,12 @@ def health_check():
         'status': 'healthy',
         'message': 'News categorization and fact-checking API is running',
         'timestamp': datetime.now().isoformat(),
-        'event_loop_running': _event_loop is not None and not _event_loop.is_closed(),
+        'event_loop_status': 'managed' if _loop_manager else 'not_initialized',
         'endpoints': ['/health', '/categorize', '/upload', '/results/<filename>', '/list-results']
     })
 
 @app.route('/categorize', methods=['POST'])
-@async_route
+@simple_async_route  # Using simpler approach for production
 async def categorize_endpoint():
     """Main categorization and fact-checking endpoint"""
     try:
@@ -447,7 +551,7 @@ async def categorize_endpoint():
         }), 500
 
 @app.route('/upload', methods=['POST'])
-@async_route
+@simple_async_route  # Using simpler approach for production
 async def upload_file():
     """Upload JSON file endpoint"""
     try:
@@ -626,16 +730,16 @@ def internal_error(e):
     }), 500
 
 def cleanup_resources():
-    """Cleanup resources on shutdown"""
-    global _event_loop, _executor, _language_tools
+    """IMPROVED cleanup function"""
+    global _executor
     
-    logger.info("Cleaning up resources...")
+    logger.info("Cleaning up application resources...")
     
     # Shutdown executor
     if _executor:
         _executor.shutdown(wait=True)
     
-    # Close language tools
+    # Cleanup language tools
     with _language_tool_lock:
         for tool in _language_tools.values():
             try:
@@ -644,10 +748,22 @@ def cleanup_resources():
                 pass
         _language_tools.clear()
     
-    # Stop event loop
-    if _event_loop and not _event_loop.is_closed():
-        _event_loop.call_soon_threadsafe(_event_loop.stop)
+    # Shutdown event loop manager
+    _loop_manager.shutdown()
+    
+    logger.info("Cleanup completed")
 
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully"""
+    logger.info(f"Received signal {signum}, cleaning up...")
+    cleanup_resources()
+    sys.exit(0)
+
+# Register signal handlers
+signal.signal(signal.SIGTERM, signal_handler)
+signal.signal(signal.SIGINT, signal_handler)
+
+# Register cleanup on exit
 import atexit
 atexit.register(cleanup_resources)
 
@@ -663,25 +779,11 @@ def get_input_from_terminal():
         lines.append(line)
     return "\n".join(lines)
 
-@app.route('/debug', methods=['GET'])
-def debug_status():
-    
-    try:
-        process = psutil.Process(os.getpid())
-        memory_mb = process.memory_info().rss / 1024 / 1024
-    except:
-        memory_mb = "unknown"
-    
-    return jsonify({
-        'memory_mb': memory_mb,
-        'threads': threading.active_count(),
-        'language_tool_status': 'initialized' if _language_tool else 'not_initialized',
-        'timestamp': datetime.now().isoformat()
-    })
+def create_app():
+    """Factory function for WSGI deployment"""
+    return app
 
 if __name__ == "__main__":
-    import sys
-    
     if '--terminal' in sys.argv or '-t' in sys.argv:
         # Terminal mode
         print("Running in terminal mode...")
@@ -700,11 +802,8 @@ if __name__ == "__main__":
                     # Parse and fact-check
                     # Implementation similar to process_single_news_item logic
     else:
-        # API mode
+        # API mode with improved initialization
         print("Starting News Categorization & Fact-Checking API (Production Ready)...")
-        print("Initializing event loop...")
-        initialize_event_loop()
-        print("Event loop initialized successfully")
         
         print("Endpoints available:")
         print("   GET  /health - Health check")
@@ -713,4 +812,15 @@ if __name__ == "__main__":
         print("   GET  /results/<filename> - Retrieve results")
         print("   GET  /list-results - List result files")
         
-        app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)
+        try:
+            app.run(
+                debug=False, 
+                host='0.0.0.0', 
+                port=5000, 
+                threaded=True,
+                use_reloader=False  # Important: disable reloader in production
+            )
+        except KeyboardInterrupt:
+            logger.info("Shutting down...")
+        finally:
+            cleanup_resources()
