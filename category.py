@@ -62,7 +62,7 @@ def async_route(f):
         try:
             return loop.run_until_complete(f(*args, **kwargs))
         finally:
-            loop.close()
+            pass # Removed loop.close() to prevent premature event loop closure
     return wrapper
 
 def process_input_with_beautiful_soup(input_content):
@@ -602,15 +602,15 @@ if __name__ == "__main__":
                         print(f"Fact-checking Result: {fact_check_result}")
     else:
         # API mode (default)
-        print("🚀 Starting News Categorization & Fact-Checking API...")
-        print("📁 Upload folder:", UPLOAD_FOLDER)
-        print("📊 Results folder:", RESULTS_FOLDER) 
-        print("🔧 Endpoints available:")
+        print(" Starting News Categorization & Fact-Checking API...")
+        print(" Upload folder:", UPLOAD_FOLDER)
+        print(" Results folder:", RESULTS_FOLDER) 
+        print(" Endpoints available:")
         print("   GET  /health - Health check")
         print("   POST /categorize - Process JSON data directly")
         print("   POST /upload - Upload JSON file")
         print("   GET  /results/<filename> - Retrieve saved results")
         print("   GET  /list-results - List all result files")
-        print("\n💡 Use --terminal or -t flag to run in original terminal mode")
+        print("\n Use --terminal or -t flag to run in original terminal mode")
         
         app.run(debug=True, host='0.0.0.0', port=5000)
