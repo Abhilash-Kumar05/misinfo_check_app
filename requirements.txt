@@ -15,4 +15,3 @@ urllib3>=1.26.0
 gunicorn
 uvicorn
 psutil>=5.9.0
-concurrent-futures>=3.1.1
