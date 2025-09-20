@@ -1,4 +1,4 @@
-# scrappingAndFactcheck.py - Production Ready Version
+# scrappingAndFactcheck.py - Production Ready Version with Fixed Event Loop
 
 import asyncio
 import aiohttp
@@ -100,6 +100,19 @@ REALTIME_DOMAIN_SOURCES = {
     "Other": REALTIME_SOURCES_GENERAL,
 }
 
+# FIXED EVENT LOOP MANAGEMENT FOR SCRAPING MODULE
+_session_lock = threading.Lock()
+_session_instances = {}
+
+def get_or_create_event_loop():
+    """Get or create event loop for current thread"""
+    try:
+        return asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
 # Thread-local storage for Gemini models
 _local = threading.local()
 
@@ -159,39 +172,44 @@ class FactCheckResult:
             'debug_data': self.debug_data
         }
 
-# Connection pool management for better performance
+# IMPROVED Connection pool management
 class ConnectionManager:
-    """Manages aiohttp session with connection pooling"""
+    """Thread-safe connection manager for aiohttp sessions"""
     
     def __init__(self):
-        self._session = None
-        self._lock = asyncio.Lock()
+        self._sessions = {}
+        self._lock = threading.Lock()
     
-    async def get_session(self):
-        """Get or create aiohttp session with connection pooling"""
-        if self._session is None or self._session.closed:
-            async with self._lock:
-                if self._session is None or self._session.closed:
-                    timeout = aiohttp.ClientTimeout(total=15, connect=10)
-                    connector = aiohttp.TCPConnector(
-                        limit=20,
-                        limit_per_host=10,
-                        ttl_dns_cache=300,
-                        use_dns_cache=True,
-                    )
-                    self._session = aiohttp.ClientSession(
-                        timeout=timeout,
-                        connector=connector,
-                        headers={
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.88 Safari/537.36"
-                        }
-                    )
-        return self._session
+    def get_session(self):
+        """Get or create aiohttp session for current thread"""
+        thread_id = threading.get_ident()
+        
+        with self._lock:
+            if thread_id not in self._sessions or self._sessions[thread_id].closed:
+                timeout = aiohttp.ClientTimeout(total=15, connect=10)
+                connector = aiohttp.TCPConnector(
+                    limit=20,
+                    limit_per_host=10,
+                    ttl_dns_cache=300,
+                    use_dns_cache=True,
+                )
+                self._sessions[thread_id] = aiohttp.ClientSession(
+                    timeout=timeout,
+                    connector=connector,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.88 Safari/537.36"
+                    }
+                )
+            
+            return self._sessions[thread_id]
     
-    async def close(self):
-        """Close the session"""
-        if self._session and not self._session.closed:
-            await self._session.close()
+    async def close_all(self):
+        """Close all sessions"""
+        with self._lock:
+            for session in self._sessions.values():
+                if not session.closed:
+                    await session.close()
+            self._sessions.clear()
 
 # Global connection manager
 _connection_manager = ConnectionManager()
@@ -373,68 +391,32 @@ async def scrape_url_with_retry(session: aiohttp.ClientSession, url: str, proxy:
     
     return None
 
-async def async_scrape(urls):
-    """Asynchronously scrape multiple URLs with proper cleanup"""
+async def async_scrape(urls: List[str]) -> List[str]:
+    """Asynchronously scrape multiple URLs with connection pooling and proxy rotation"""
     logger.info(f"Scraping {len(urls)} URLs...")
     scraped_contents = []
     
-    # Use proper connector with limits
-    connector = aiohttp.TCPConnector(
-        limit=100,
-        limit_per_host=30,
-        ttl_dns_cache=300,
-        use_dns_cache=True,
-    )
+    # Create proxy cycle if available
+    proxy_cycle = None
+    if PROXIES:
+        random.shuffle(PROXIES)
+        proxy_cycle = iter(PROXIES * ((len(urls) // len(PROXIES)) + 1))
     
-    timeout = aiohttp.ClientTimeout(total=30, connect=10)
+    session = _connection_manager.get_session()
     
-    try:
-        async with aiohttp.ClientSession(
-            connector=connector,
-            timeout=timeout
-        ) as session:
-            # If proxies are available, create a rotating list of them
-            if PROXIES:
-                proxy_iterator = iter(random.sample(PROXIES, len(PROXIES)))
+    # Process URLs with concurrency control
+    semaphore = asyncio.Semaphore(5)  # Limit concurrent requests
+    
+    async def scrape_with_semaphore(url):
+        async with semaphore:
+            proxy = next(proxy_cycle, None) if proxy_cycle else None
+            content = await scrape_url_with_retry(session, url, proxy)
+            if content:
+                logger.info(f"Successfully scraped content from {url}. Length: {len(content)}")
+                return content
             else:
-                proxy_iterator = iter([]) # Empty iterator if no proxies
-
-            for url in urls:
-                current_proxy = next(proxy_iterator, None)
-                if PROXIES and current_proxy is None:
-                    # If all proxies used, reset the iterator for another round
-                    proxy_iterator = iter(random.sample(PROXIES, len(PROXIES)))
-                    current_proxy = next(proxy_iterator)
-                
-                try:
-                    content = await scrape_url(session, url, proxy=current_proxy)
-                    if content:
-                        scraped_contents.append(content)
-                except aiohttp.ClientResponseError as e:
-                    if e.status == 429:
-                        logger.warning(f"Received 429 (Too Many Requests) for {url}. Rotating proxy and retrying after delay...")
-                        await asyncio.sleep(random.uniform(5, 15))
-                        # Attempt with a new proxy immediately
-                        current_proxy = next(proxy_iterator, None)
-                        if PROXIES and current_proxy is None:
-                            proxy_iterator = iter(random.sample(PROXIES, len(PROXIES)))
-                            current_proxy = next(proxy_iterator)
-                        content = await scrape_url(session, url, proxy=current_proxy)
-                        if content:
-                            scraped_contents.append(content)
-                    else:
-                        logger.error(f"HTTP error {e.status} for {url}: {e}")
-                except Exception as e:
-                    logger.error(f"Error scraping {url}: {e}")
-                    
-    except Exception as e:
-        logger.error(f"Session error: {e}")
-    finally:
-        # Ensure connector is properly closed
-        if not connector.closed:
-            await connector.close()
-    
-    return scraped_contents
+                logger.warning(f"No content scraped from {url}")
+                return None
     
     tasks = [scrape_with_semaphore(url) for url in urls]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -581,10 +563,13 @@ def save_debug_data(result: FactCheckResult, news_text: str, news_type: str, mis
         return None
 
 async def initialize_fact_checker(news_type: str, news_text: str, misinformation_domain: str, news_id: Optional[str] = None) -> FactCheckResult:
-    """Main fact-checking function - production ready"""
+    """Main fact-checking function - production ready with fixed event loop"""
     result = FactCheckResult(news_id=news_id)
     
     try:
+        # Ensure we have an event loop for this thread
+        loop = get_or_create_event_loop()
+        
         if news_type == "Evergreen News":
             logger.info(f"Starting evergreen fact-check for: {news_text[:100]}...")
             
@@ -696,11 +681,11 @@ async def initialize_fact_checker(news_type: str, news_text: str, misinformation
 # Cleanup function
 async def cleanup_connections():
     """Cleanup aiohttp connections"""
-    await _connection_manager.close()
+    await _connection_manager.close_all()
 
 # Register cleanup on exit
 import atexit
-atexit.register(lambda: asyncio.create_task(cleanup_connections()) if asyncio.get_event_loop().is_running() else None)
+atexit.register(lambda: asyncio.get_event_loop().run_until_complete(cleanup_connections()) if hasattr(asyncio, '_get_running_loop') and asyncio._get_running_loop() else None)
 
 if __name__ == "__main__":
     # Test the updated system
@@ -716,4 +701,14 @@ if __name__ == "__main__":
         # Cleanup
         await cleanup_connections()
     
-    asyncio.run(test_fact_checker())
+    # Use the safer event loop approach
+    try:
+        loop = get_or_create_event_loop()
+        loop.run_until_complete(test_fact_checker())
+    except Exception as e:
+        print(f"Error running test: {e}")
+    finally:
+        try:
+            loop.run_until_complete(cleanup_connections())
+        except:
+            pass
