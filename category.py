@@ -7,15 +7,13 @@ from datetime import datetime
 import uuid
 from functools import wraps
 import logging
-from dotenv import load_dotenv
-
-import language_tool_python # Added for grammar correction
 
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
 import google.generativeai as genai
 import requests
 from bs4 import BeautifulSoup
+import language_tool_python
 
 # Import the fact-checking module
 from scrappingAndFactcheck import initialize_fact_checker
@@ -23,9 +21,6 @@ from scrappingAndFactcheck import initialize_fact_checker
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Load environment variables
-load_dotenv("key.env")
 
 # Flask app setup
 app = Flask(__name__)
@@ -40,18 +35,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(RESULTS_FOLDER, exist_ok=True)
 
 # Configure Gemini API (keeping your hardcoded key)
-genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
-
-# Initialize LanguageTool globally for better performance
-_language_tool = None
-
-def get_language_tool():
-    """Get or create LanguageTool instance (singleton pattern for better performance)"""
-    global _language_tool
-    if _language_tool is None:
-        logger.info("Initializing LanguageTool...")
-        _language_tool = language_tool_python.LanguageTool('en-US')
-    return _language_tool
+genai.configure(api_key="AIzaSyAZ-RURZ6LIVw7YCG25Y5A2GgbLj0aIXU0")
 
 # Decorator for async route handling (because Flask doesn't play nice with async)
 def async_route(f):
@@ -62,7 +46,7 @@ def async_route(f):
         try:
             return loop.run_until_complete(f(*args, **kwargs))
         finally:
-            pass # Removed loop.close() to prevent premature event loop closure
+            loop.close()
     return wrapper
 
 def process_input_with_beautiful_soup(input_content):
@@ -87,38 +71,20 @@ def process_input_with_beautiful_soup(input_content):
         return input_content
 
 def correct_grammar_with_languagetool(text):
-    """Enhanced grammar correction function using LanguageTool with better error handling"""
-    logger.info("Correcting grammar of input with LanguageTool...")
+    """Your existing grammar correction function - keeping it because grammar matters"""
+    print("\nCorrecting grammar of input with LanguageTool...")
     try:
-        tool = get_language_tool()
-        
-        # Define a list of custom words to avoid false positives
-        custom_words = ['Ghee', 'vanaspati', 'misinformation', 'cryptocurrency', 'blockchain']
-        
-        # Check the text
+        tool = language_tool_python.LanguageTool('en-US')
+
+        # Define a list of non-English words to be recognized (not used for disabling spellchecking directly)
+        custom_words = ['Ghee', 'vanaspati', 'misinformation'] # Kept for reference if needed elsewhere
+
         matches = tool.check(text)
-        
-        # Filter out matches for custom words (basic approach)
-        filtered_matches = []
-        for match in matches:
-            # Skip spell-check errors for custom words
-            if match.ruleId == 'MORFOLOGIK_RULE_EN_US':
-                error_word = text[match.offset:match.offset + match.errorLength].lower()
-                if any(custom_word.lower() in error_word for custom_word in custom_words):
-                    continue
-            filtered_matches.append(match)
-        
-        # Apply corrections
-        corrected_text = language_tool_python.utils.correct(text, filtered_matches)
-        
-        if corrected_text != text:
-            logger.info(f"Grammar corrections applied: {len(filtered_matches)} changes made")
-        
+        corrected_text = language_tool_python.utils.correct(text, matches)
         return corrected_text
-        
     except Exception as e:
         logger.error(f"Error correcting grammar with LanguageTool: {e}")
-        return text  # Return original text if correction fails
+        return text # Return original text if correction fails
 
 def categorize_news_with_gemini(news_text):
     """Your existing categorization function - ain't broken, don't fix it"""
@@ -240,16 +206,6 @@ async def process_single_news_item(news_item):
                 
             except Exception as e:
                 logger.error(f"Fact-checking failed for {news_id}: {e}")
-                result['fact_check_error'] = str(e)
-                result['fact_check_completed'] = False
-        elif news_type == "Real-time News":
-            logger.info(f"Initiating Real-time News fact-check for {news_id}...")
-            try:
-                fact_check_result_obj = await initialize_fact_checker(news_type, corrected_news_content, misinformation_domain)
-                result.update(fact_check_result_obj.to_dict())
-                result['fact_check_completed'] = fact_check_result_obj.success
-            except Exception as e:
-                logger.error(f"Real-time Fact-checking failed for {news_id}: {e}")
                 result['fact_check_error'] = str(e)
                 result['fact_check_completed'] = False
         else:
@@ -557,18 +513,18 @@ if __name__ == "__main__":
             print(f"Raw Input Length: {len(news_content)} characters")
             print(f"Raw Input: {news_content}")
 
-            processed_content = process_input_with_beautiful_soup(news_content)
+            corrected_news_content = correct_grammar_with_languagetool(news_content)
+            if corrected_news_content != news_content:
+                print("\n--- Grammar Corrected Input (LanguageTool) ---")
+                print(f"Corrected Input: {corrected_news_content}")
+            
+            processed_content = process_input_with_beautiful_soup(corrected_news_content)
             if processed_content:
                 print("\n--- Processed Content ---")
                 print(f"Processed Length: {len(processed_content)} characters")
                 print(f"Processed: {processed_content}")
                 print("\nSending to Gemini for categorization...")
-                corrected_news_content = correct_grammar_with_languagetool(processed_content)
-                if corrected_news_content != processed_content:
-                    print("\n--- Grammar Corrected Input (LanguageTool) ---")
-                    print(f"Corrected Input: {corrected_news_content}")
-                
-                full_category_output = categorize_news_with_gemini(corrected_news_content)
+                full_category_output = categorize_news_with_gemini(processed_content)
                 if full_category_output:
                     print(f"\n--- Gemini Raw Output ---")
                     print(full_category_output)
@@ -598,7 +554,7 @@ if __name__ == "__main__":
                     
                     if news_type == "Evergreen News":
                         print("\nInitiating Evergreen News fact-check...")
-                        fact_check_result = asyncio.run(initialize_fact_checker(news_type, corrected_news_content, misinformation_domain))
+                        fact_check_result = asyncio.run(initialize_fact_checker(news_type, processed_content, misinformation_domain))
                         print(f"Fact-checking Result: {fact_check_result}")
     else:
         # API mode (default)
