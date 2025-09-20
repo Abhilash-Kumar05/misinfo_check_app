@@ -7,26 +7,18 @@ import google.generativeai as genai
 import os
 import requests
 import json
-from dotenv import load_dotenv
 from datetime import datetime
 import logging
-import random # Import random for proxy selection
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
-# Load environment variables
-load_dotenv("key.env")
-
-# Load proxies from environment variable
-PROXIES = os.getenv('PROXIES').split(',') if os.getenv('PROXIES') else []
-
 # Configure Gemini API for this module as well
-genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+genai.configure(api_key="AIzaSyAZ-RURZ6LIVw7YCG25Y5A2GgbLj0aIXU0")
 
 # Google Custom Search API configuration
-GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
-GOOGLE_CSE_ID = os.getenv('GOOGLE_CSE_ID')
+GOOGLE_API_KEY = "AIzaSyCxx_8Uxs7i0wTZVt3HE0l4c1oYa8lN8aQ"
+GOOGLE_CSE_ID = "f705585dd92b34144"
 GOOGLE_SEARCH_URL = "https://www.googleapis.com/customsearch/v1"
 
 # Predefined lists of trusted websites for fact-checking evergreen news by domain
@@ -127,33 +119,6 @@ DOMAIN_TRUSTED_WEBSITES = {
     "Other": GENERAL_TRUSTED_WEBSITES,
 }
 
-# Curated real-time oriented sources (social + news wires + breaking pages)
-REALTIME_SOURCES_GENERAL = [
-    "reddit.com",
-    "reuters.com", "apnews.com", "bbc.com", "cnn.com",
-    "indianexpress.com", "thehindu.com", "timesofindia.indiatimes.com",
-    "hindustantimes.com", "thewire.in", "republicworld.com",
-    "indiatoday.in", "news18.com", "zeenews.india.com"
-]
-
-REALTIME_SOURCES_FINANCE = [
-    "moneycontrol.com", "bloomberg.com", "cnbc.com", "economictimes.indiatimes.com",
-    "livemint.com", "reuters.com", "apnews.com"
-]
-
-REALTIME_SOURCES_HEALTH = [
-    "reuters.com", "apnews.com", "bbc.com", "cnn.com",
-    # Social signals can surface breaking claims, still included
-    "reddit.com"
-]
-
-REALTIME_DOMAIN_SOURCES = {
-    "Health": REALTIME_SOURCES_HEALTH,
-    "Finance": REALTIME_SOURCES_FINANCE,
-    "General": REALTIME_SOURCES_GENERAL,
-    "Other": REALTIME_SOURCES_GENERAL,
-}
-
 class FactCheckResult:
     """Structured result class for fact-checking operations"""
     def __init__(self, news_id=None):
@@ -225,7 +190,6 @@ async def google_search_and_filter(query, misinformation_domain, max_total_resul
             all_search_items.extend(search_results.get("items"))
         else:
             break
-        await asyncio.sleep(1) # Add a 1-second delay between API calls
 
     logger.info(f"Found {len(all_search_items)} total search results for '{query}'")
 
@@ -235,155 +199,49 @@ async def google_search_and_filter(query, misinformation_domain, max_total_resul
         if url:
             for trusted_domain in trusted_domains_list:
                 if trusted_domain in url and url not in filtered_urls:
-                    logger.info(f"Adding trusted URL (Evergreen): {url} (matched {trusted_domain})")
                     filtered_urls.append(url)
                     if len(filtered_urls) >= 5:
                         return filtered_urls
-    logger.info(f"Filtered (Evergreen) {len(filtered_urls)} URLs for query '{query}'")
     return filtered_urls
 
-async def google_search_realtime(query, misinformation_domain, max_total_results=30, num_per_request=10):
-    logger.info(f"Searching Google for real-time sources: \"{query}\" ...")
-    if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
-        logger.error("Google API Key or CSE ID not configured")
-        return []
-
-    preferred_domains = REALTIME_DOMAIN_SOURCES.get(misinformation_domain, REALTIME_SOURCES_GENERAL)
-
-    all_search_items = []
-    for i in range(0, max_total_results, num_per_request):
-        start_index = i + 1
-        search_results = await perform_google_search(query, start_index, num_per_request)
-        if search_results and search_results.get("items"):
-            all_search_items.extend(search_results.get("items"))
-        else:
-            break
-
-    filtered_urls = []
-    for item in all_search_items:
-        url = item.get("link")
-        title = item.get("title", "").lower()
-        snippet = item.get("snippet", "").lower()
-        
-        # Keywords to look for in title and snippet
-        keywords = query.lower().split()[:5] # Use first 5 words of news_text as keywords
-        if not any(keyword in title or keyword in snippet for keyword in keywords):
-            logger.info(f"Skipping irrelevant search result: {title} - {url}")
-            continue
-
-        if not url:
-            continue
-        for domain in preferred_domains:
-            if domain in url and url not in filtered_urls:
-                logger.info(f"Adding preferred real-time URL: {url} (matched {domain})")
-                filtered_urls.append(url)
-                break
-        if len(filtered_urls) >= 8:
-            break
-
-    # Fallback: if not enough, allow any reputable news if present
-    if len(filtered_urls) < 3:
-        logger.info(f"Not enough preferred real-time URLs found. Falling back to general news for query '{query}'.")
-        for item in all_search_items:
-            url = item.get("link")
-            title = item.get("title", "").lower()
-            snippet = item.get("snippet", "").lower()
-            
-            # Apply keyword filter to fallback as well
-            if not any(keyword in title or keyword in snippet for keyword in keywords):
-                logger.info(f"Skipping irrelevant fallback search result: {title} - {url}")
-                continue
-
-            if not url or url in filtered_urls:
-                continue
-            if any(d in url for d in ["news", "live", "breaking", "latest"]):
-                logger.info(f"Adding fallback real-time URL: {url}")
-                filtered_urls.append(url)
-            if len(filtered_urls) >= 8:
-                break
-
-    logger.info(f"Filtered (Real-time) {len(filtered_urls)} URLs for query '{query}'")
-    return filtered_urls
-
-async def scrape_url(session, url, proxy=None):
-    """Scrape content from a single URL without retry logic, with optional proxy"""
+async def scrape_url(session, url, retry_limit=3, retry_delay=2):
+    """Scrape content from a single URL with retry logic"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.4896.88 Safari/537.36"
     }
     
-    try:
-        async with session.get(url, timeout=10, headers=headers, proxy=proxy) as response:
-            response.raise_for_status()
-            html_content = await response.text()
-            soup = BeautifulSoup(html_content, 'html.parser')
-            
-            # Extract text from common elements that hold main content
-            paragraphs = soup.find_all('p')
-            text_content = ' '.join([p.get_text() for p in paragraphs])
-            if not text_content:
-                text_content = soup.get_text()
-            return text_content.strip()
-    except aiohttp.ClientResponseError as e:
-        if e.status == 403:
-            logger.warning(f"Received 403 (Forbidden) for {url}. Skipping this URL.")
-            return None
-        elif e.status == 429:
-            # This case should ideally be handled by async_scrape's retry logic with proxy rotation
-            logger.warning(f"Received 429 (Too Many Requests) for {url}. This should be handled upstream by proxy rotation.")
-            return None # Do not retry within scrape_url for 429
-        logger.warning(f"HTTP error {e.status} fetching {url}: {e}")
-    except aiohttp.ClientError as e:
-        logger.warning(f"Error fetching {url}: {e}")
-    except asyncio.TimeoutError:
-        logger.warning(f"Timeout fetching {url}")
-    except Exception as e:
-        logger.warning(f"Unexpected error scraping {url}: {e}")
+    for attempt in range(retry_limit):
+        try:
+            async with session.get(url, timeout=10, headers=headers) as response:
+                response.raise_for_status()
+                html_content = await response.text()
+                soup = BeautifulSoup(html_content, 'html.parser')
+                
+                # Extract text from common elements that hold main content
+                paragraphs = soup.find_all('p')
+                text_content = ' '.join([p.get_text() for p in paragraphs])
+                if not text_content:
+                    text_content = soup.get_text()
+                return text_content.strip()
+        except aiohttp.ClientError as e:
+            logger.warning(f"Error fetching {url} (attempt {attempt + 1}/{retry_limit}): {e}")
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout fetching {url} (attempt {attempt + 1}/{retry_limit})")
+        except Exception as e:
+            logger.warning(f"Unexpected error scraping {url} (attempt {attempt + 1}/{retry_limit}): {e}")
+        
+        if attempt < retry_limit - 1:
+            await asyncio.sleep(retry_delay)
             
     return None
 
 async def async_scrape(urls):
-    """Asynchronously scrape multiple URLs using rotating proxies if available"""
+    """Asynchronously scrape multiple URLs"""
     logger.info(f"Scraping {len(urls)} URLs...")
-    scraped_contents = []
-    # If proxies are available, create a rotating list of them
-    if PROXIES:
-        proxy_iterator = iter(random.sample(PROXIES, len(PROXIES)))
-    else:
-        proxy_iterator = iter([]) # Empty iterator if no proxies
-
     async with aiohttp.ClientSession() as session:
-        for url in urls:
-            current_proxy = next(proxy_iterator, None)
-            if PROXIES and current_proxy is None:
-                # If all proxies used, reset the iterator for another round
-                proxy_iterator = iter(random.sample(PROXIES, len(PROXIES)))
-                current_proxy = next(proxy_iterator)
-            
-            try:
-                logger.info(f"Attempting to scrape {url} with proxy: {current_proxy}")
-                content = await scrape_url(session, url, proxy=current_proxy)
-                if content:
-                    scraped_contents.append(content)
-                    logger.info(f"Successfully scraped content from {url}. Content length: {len(content)}")
-                else:
-                    logger.warning(f"No content scraped from {url}.")
-            except aiohttp.ClientResponseError as e:
-                if e.status == 429:
-                    logger.warning(f"Received 429 (Too Many Requests) for {url}. Rotating proxy and retrying after delay...")
-                    await asyncio.sleep(random.uniform(5, 15)) # Wait 5-15 seconds before retrying
-                    # Attempt with a new proxy immediately
-                    current_proxy = next(proxy_iterator, None)
-                    if PROXIES and current_proxy is None:
-                        proxy_iterator = iter(random.sample(PROXIES, len(PROXIES)))
-                        current_proxy = next(proxy_iterator)
-                    content = await scrape_url(session, url, proxy=current_proxy)
-                    if content:
-                        scraped_contents.append(content)
-                else:
-                    logger.error(f"HTTP error {e.status} for {url}: {e}")
-            except Exception as e:
-                logger.error(f"Error scraping {url}: {e}")
-    return scraped_contents
+        tasks = [scrape_url(session, url) for url in urls]
+        scraped_contents = await asyncio.gather(*tasks)
+        return [content for content in scraped_contents if content]
 
 async def fact_check_evergreen_misinformation(input_news_text, scraped_data):
     """Compare input news with trusted sources using Gemini"""
@@ -397,61 +255,25 @@ async def fact_check_evergreen_misinformation(input_news_text, scraped_data):
             "temperature": 0.1,
             "top_p": 1,
             "top_k": 1,
-            "max_output_tokens": 500,
+            "max_output_tokens": 300,
         },
     )
 
     prompt = f"""Given the following original news text and content from trusted sources, analyze if the original news text contains misinformation related to evergreen topics.
-    Focus on factual accuracy and consistency with the trusted sources. Provide a direct assessment of 'True', 'Potentially Misleading', or 'False' with a concise explanation of 2-3 lines, referencing sources for key confirmations or contradictions.
+    Focus on factual accuracy and consistency with the trusted sources.
 
     Original News Text: {input_news_text}
 
-    Trusted Sources Content: {combined_trusted_content[:8000]}
+    Trusted Sources Content: {combined_trusted_content[:2000]}
 
-    Assessment:"""
+    Based on the comparison, state clearly if the Original News Text is likely 'True', 'Potentially Misleading', or 'False'. Also, provide a brief explanation for your assessment."""
 
     try:
         response = await model.generate_content_async(prompt)
         return response.text.strip()
-    except RuntimeError as e:
-        logger.error(f"Event loop error during Gemini fact-check: {e}")
-        return "Fact-checking failed due to an event loop error."
     except Exception as e:
         logger.error(f"Error during Gemini fact-check: {e}")
         return "Fact-checking failed due to an error."
-
-async def fact_check_realtime_misinformation(input_news_text, scraped_data):
-    logger.info("Applying real-time fact-checking logic...")
-    combined_trusted_content = " ".join(scraped_data)
-
-    model = genai.GenerativeModel(
-        model_name="gemini-1.5-flash",
-        generation_config={
-            "temperature": 0.15,
-            "top_p": 1,
-            "top_k": 1,
-            "max_output_tokens": 500,
-        },
-    )
-
-    prompt = f"""Given the following current claim and content scraped from real-time sources (news wires, social feeds, latest articles), assess if the claim is likely true, needs verification, or false.
-    Specifically, compare the claim with the real-time source content. Provide a direct judgment: 'True', 'Needs Verification', or 'False', with a concise reasoning of 2-3 lines. Prioritize wire services and reputable outlets.
-
-Claim: {input_news_text}
-
-Real-time Source Content: {combined_trusted_content[:8000]}
-
-Judgment:"""
-
-    try:
-        response = await model.generate_content_async(prompt)
-        return response.text.strip()
-    except RuntimeError as e:
-        logger.error(f"Event loop error during Gemini real-time fact-check: {e}")
-        return "Real-time fact-checking failed due to an event loop error."
-    except Exception as e:
-        logger.error(f"Error during Gemini real-time fact-check: {e}")
-        return "Real-time fact-checking failed due to an error."
 
 async def summarize_scraped_data_with_gemini(scraped_data):
     """Summarize scraped data using Gemini"""
@@ -469,19 +291,16 @@ async def summarize_scraped_data_with_gemini(scraped_data):
         },
     )
 
-    prompt = f"""Based on the following content from trusted sources, provide a concise and direct summary of the key information related to the topic, keeping the length to a minimum while retaining essential facts.
+    prompt = f"""Based on the following content from trusted sources, provide a concise summary of the key information related to the topic.
 
     Trusted Sources Content:
-    {combined_content[:4000]}
+    {combined_content[:3000]}
 
     Summary:"""
 
     try:
         response = await model.generate_content_async(prompt)
         return response.text.strip()
-    except RuntimeError as e:
-        logger.error(f"Event loop error during Gemini summarization: {e}")
-        return "Summarization failed due to an event loop error."
     except Exception as e:
         logger.error(f"Error during Gemini summarization: {e}")
         return "Summarization failed due to an error."
@@ -500,16 +319,13 @@ async def generate_further_education(news_text, misinformation_domain):
         },
     )
 
-    prompt = f"""Given the original news topic: "{news_text}" (categorized as {misinformation_domain} misinformation), suggest 3-5 concise key areas or reputable resources for an individual to further educate themselves to avoid similar misinformation in the future. Focus on critical thinking, media literacy, and understanding the {misinformation_domain} domain. Provide each suggestion on a new line, keeping each point to a single sentence.
+    prompt = f"""Given the original news topic: "{news_text}" (categorized as {misinformation_domain} misinformation), suggest 3-5 key areas or reputable resources for an individual to further educate themselves to avoid similar misinformation in the future. Focus on critical thinking, media literacy, and understanding the {misinformation_domain} domain.
 
     Suggestions:"""
 
     try:
         response = await model.generate_content_async(prompt)
         return response.text.strip()
-    except RuntimeError as e:
-        logger.error(f"Event loop error generating further education: {e}")
-        return "Further education suggestions could not be generated due to an event loop error."
     except Exception as e:
         logger.error(f"Error generating further education: {e}")
         return "Further education suggestions could not be generated."
@@ -554,129 +370,75 @@ async def initialize_fact_checker(news_type, news_text, misinformation_domain, n
     """Main fact-checking function - updated for Flask integration"""
     result = FactCheckResult(news_id=news_id)
     
-    if news_type == "Evergreen News":
-        logger.info(f"Starting fact-check for evergreen news: {news_text[:100]}...")
+    if news_type != "Evergreen News":
+        result.fact_check_assessment = "Not applicable for real-time news"
+        result.success = True
+        return result
+
+    logger.info(f"Starting fact-check for evergreen news: {news_text[:100]}...")
+    
+    try:
+        # Search for trusted URLs
+        search_query = news_text
+        result.trusted_urls = await google_search_and_filter(search_query, misinformation_domain)
         
-        try:
-            # Search for trusted URLs
-            search_query = news_text
-            result.trusted_urls = await google_search_and_filter(search_query, misinformation_domain)
-            
-            if not result.trusted_urls:
-                result.processing_errors.append("No trusted sources found")
-                result.fact_check_assessment = "N/A - No trusted sources found"
-                result.trust_score = 0.0
-                return result
+        if not result.trusted_urls:
+            result.processing_errors.append("No trusted sources found")
+            result.fact_check_assessment = "N/A - No trusted sources found"
+            result.trust_score = 0.0
+            return result
 
-            logger.info(f"Found {len(result.trusted_urls)} trusted URLs for scraping")
-            result.sources_used = result.trusted_urls.copy()
-            
-            # Scrape content
-            result.scraped_contents = await async_scrape(result.trusted_urls)
-            result.scraped_content_count = len(result.scraped_contents)
-            
-            if not result.scraped_contents:
-                result.processing_errors.append("Could not scrape content from any trusted URLs")
-                result.fact_check_assessment = "N/A - No content scraped from trusted URLs"
-                result.trust_score = 0.0
-                return result
+        logger.info(f"Found {len(result.trusted_urls)} trusted URLs for scraping")
+        result.sources_used = result.trusted_urls.copy()
+        
+        # Scrape content
+        result.scraped_contents = await async_scrape(result.trusted_urls)
+        result.scraped_content_count = len(result.scraped_contents)
+        
+        if not result.scraped_contents:
+            result.processing_errors.append("Could not scrape content from any trusted URLs")
+            result.fact_check_assessment = "N/A - No content scraped from trusted URLs"
+            result.trust_score = 0.0
+            return result
 
-            logger.info(f"Successfully scraped content from {result.scraped_content_count} URLs")
+        logger.info(f"Successfully scraped content from {result.scraped_content_count} URLs")
 
-            # Summarize scraped data
-            result.summarized_answer = await summarize_scraped_data_with_gemini(result.scraped_contents)
+        # Summarize scraped data
+        result.summarized_answer = await summarize_scraped_data_with_gemini(result.scraped_contents)
 
-            # Generate education suggestions
-            result.further_education_suggestions = await generate_further_education(news_text, misinformation_domain)
+        # Generate education suggestions
+        result.further_education_suggestions = await generate_further_education(news_text, misinformation_domain)
 
-            # Perform fact-check
-            result.fact_check_assessment = await fact_check_evergreen_misinformation(news_text, result.scraped_contents)
+        # Perform fact-check
+        result.fact_check_assessment = await fact_check_evergreen_misinformation(news_text, result.scraped_contents)
 
-            # Calculate trust score
-            result.trust_score = calculate_trust_score(result.fact_check_assessment)
+        # Calculate trust score
+        result.trust_score = calculate_trust_score(result.fact_check_assessment)
 
-            # Save debug data
-            debug_filename = save_debug_data(result, news_text, news_type, misinformation_domain)
-            if debug_filename:
-                result.debug_data['saved_file'] = debug_filename
+        # Save debug data
+        debug_filename = save_debug_data(result, news_text, news_type, misinformation_domain)
+        if debug_filename:
+            result.debug_data['saved_file'] = debug_filename
 
-            result.success = True
-            logger.info("Fact-checking completed successfully")
+        result.success = True
+        logger.info("Fact-checking completed successfully")
 
-        except Exception as e:
-            logger.error(f"Error during fact-checking: {e}")
-            result.processing_errors.append(f"Fact-checking failed: {str(e)}")
-            result.success = False
-
-        return result
-    elif news_type == "Real-time News":
-        logger.info(f"Starting fact-check for real-time news: {news_text[:100]}...")
-        try:
-            search_query = news_text
-            result.trusted_urls = await google_search_realtime(search_query, misinformation_domain)
-
-            if not result.trusted_urls:
-                result.processing_errors.append("No real-time sources found")
-                result.fact_check_assessment = "N/A - No real-time sources found"
-                result.trust_score = 0.0
-                return result
-            
-            logger.info(f"Found {len(result.trusted_urls)} real-time URLs for scraping")
-            result.sources_used = result.trusted_urls.copy()
-
-            result.scraped_contents = await async_scrape(result.trusted_urls)
-            result.scraped_content_count = len(result.scraped_contents)
-
-            if not result.scraped_contents:
-                result.processing_errors.append("Could not scrape content from any real-time URLs")
-                result.fact_check_assessment = "N/A - No content scraped from real-time URLs"
-                result.trust_score = 0.0
-                return result
-            
-            logger.info(f"Successfully scraped content from {result.scraped_content_count} URLs")
-
-            result.summarized_answer = await summarize_scraped_data_with_gemini(result.scraped_contents)
-            result.further_education_suggestions = await generate_further_education(news_text, misinformation_domain)
-            result.fact_check_assessment = await fact_check_realtime_misinformation(news_text, result.scraped_contents)
-            
-            # Simple trust heuristic for real-time
-            if "true" in result.fact_check_assessment.lower():
-                result.trust_score = 8.0
-            elif "needs verification" in result.fact_check_assessment.lower():
-                result.trust_score = 4.0
-            elif "false" in result.fact_check_assessment.lower():
-                result.trust_score = 1.0
-            else:
-                result.trust_score = 0.0
-            
-            # Save debug data
-            debug_filename = save_debug_data(result, news_text, news_type, misinformation_domain)
-            if debug_filename:
-                result.debug_data['saved_file'] = debug_filename
-
-            result.success = True
-            logger.info("Real-time fact-checking completed successfully")
-
-        except Exception as e:
-            logger.error(f"Error during real-time fact-checking: {e}")
-            result.processing_errors.append(f"Real-time fact-checking failed: {str(e)}")
-            result.success = False
-
-        return result
-    else:
-        result.fact_check_assessment = "News type not recognized for fact-checking."
+    except Exception as e:
+        logger.error(f"Error during fact-checking: {e}")
+        result.processing_errors.append(f"Fact-checking failed: {str(e)}")
         result.success = False
-        return result
+
+    return result
 
 # Backward compatibility function
-# async def initialize_fact_checker_legacy(news_type, news_text, misinformation_domain):
-#     """Legacy function for backward compatibility with existing code"""
-#     result = await initialize_fact_checker(news_type, news_text, misinformation_domain)
+async def initialize_fact_checker_legacy(news_type, news_text, misinformation_domain):
+    """Legacy function for backward compatibility with existing code"""
+    result = await initialize_fact_checker(news_type, news_text, misinformation_domain)
     
-#     if result.success:
-#         return "Evergreen fact-checking process completed successfully."
-#     else:
-#         return f"Fact-checking failed: {'; '.join(result.processing_errors)}"
+    if result.success:
+        return "Evergreen fact-checking process completed successfully."
+    else:
+        return f"Fact-checking failed: {'; '.join(result.processing_errors)}"
 
 if __name__ == "__main__":
     # Test the updated system
