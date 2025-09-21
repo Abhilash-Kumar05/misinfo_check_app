@@ -4,7 +4,7 @@ import 'package:http/http.dart' as http;
 
 class GoogleFactCheckService {
   static const String baseUrl = "https://factchecktools.googleapis.com/v1alpha1";
-  static const String apiKey = "AIzaSyAusLAIpIXZlDXLfDVZGiisTfzPXSYr280"; // Replace with your actual API key
+  static const String apiKey = String.fromEnvironment("API_KEY"); 
 
   /// Search for fact-checked claims
   static Future<FactCheckResponse> searchClaims({
