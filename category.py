@@ -284,7 +284,7 @@ def get_gemini_model(config=None):
             default_config.update(config)
             
         _local.model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name="gemini-1.5-pro",
             generation_config=default_config,
         )
     return _local.model
@@ -318,7 +318,7 @@ def correct_grammar_with_languagetool(text):
     try:
         with get_language_tool() as tool:
             # Define custom words to avoid false positives
-            custom_words = ['Ghee', 'vanaspati', 'misinformation', 'cryptocurrency', 'blockchain']
+            custom_words = ['misinformation', 'cryptocurrency', 'blockchain']
             
             # Check the text
             matches = tool.check(text)
