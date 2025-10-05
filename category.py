@@ -331,7 +331,7 @@ def get_gemini_model(config=None):
         ]
             
         _local.model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash",
+            model_name="gemini-2.5-flash-lite",
             generation_config=default_config,
             safety_settings=safety_settings  # Add this
         )
