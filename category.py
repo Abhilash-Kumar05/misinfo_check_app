@@ -309,10 +309,31 @@ def get_gemini_model(config=None):
         }
         if config:
             default_config.update(config)
+        
+        # Add safety settings
+        safety_settings = [
+            {
+                "category": "HARM_CATEGORY_HARASSMENT",
+                "threshold": "BLOCK_NONE"
+            },
+            {
+                "category": "HARM_CATEGORY_HATE_SPEECH",
+                "threshold": "BLOCK_NONE"
+            },
+            {
+                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                "threshold": "BLOCK_NONE"
+            },
+            {
+                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                "threshold": "BLOCK_NONE"
+            },
+        ]
             
         _local.model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash",
+            model_name="gemini-1.5-pro-latest",
             generation_config=default_config,
+            safety_settings=safety_settings  # Add this
         )
     return _local.model
 
