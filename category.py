@@ -49,18 +49,30 @@ os.makedirs(RESULTS_FOLDER, exist_ok=True)
 genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
 
 #this is to check the available gemini model
-def list_available_models():
-    """List all available Gemini models"""
+def check_available_gemini_models():
+    """Check and log available Gemini models on startup"""
     try:
-        logger.info("Checking available Gemini models...")
+        logger.info("=" * 50)
+        logger.info("CHECKING AVAILABLE GEMINI MODELS")
+        logger.info("=" * 50)
+        
         available_models = []
         for model in genai.list_models():
             if 'generateContent' in model.supported_generation_methods:
-                logger.info(f"Available model: {model.name}")
                 available_models.append(model.name)
+                logger.info(f" Available: {model.name}")
+        
+        if not available_models:
+            logger.error("NO MODELS FOUND - Check your API key")
+        else:
+            logger.info(f"\nTotal models available: {len(available_models)}")
+            logger.info("=" * 50)
+        
         return available_models
+        
     except Exception as e:
-        logger.error(f"Error listing models: {e}")
+        logger.error(f" Error checking models: {e}")
+        logger.error(f"API Key present: {bool(os.getenv('GEMINI_API_KEY'))}")
         return []
 
 # FIXED EVENT LOOP MANAGEMENT
@@ -826,6 +838,7 @@ if __name__ == "__main__":
         print("   POST /upload - Upload JSON file")
         print("   GET  /results/<filename> - Retrieve results")
         print("   GET  /list-results - List result files")
+        available_models = check_available_gemini_models()
         
         try:
             app.run(
