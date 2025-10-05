@@ -412,10 +412,35 @@ def categorize_news_with_gemini(news_text):
 
     try:
         response = model.generate_content(prompt)
-        return response.text.strip()
+        
+        # Check if response has candidates
+        if not response.candidates:
+            logger.error("No candidates in response - content may be blocked")
+            return "News Type: General, Misinformation Domain: Other"
+        
+        # Check the first candidate's finish reason
+        candidate = response.candidates[0]
+        finish_reason = candidate.finish_reason
+        
+        # Log finish reason for debugging
+        logger.info(f"Finish reason: {finish_reason}")
+        
+        if finish_reason != 1:  # 1 = STOP (normal completion)
+            logger.warning(f"Abnormal finish reason: {finish_reason}")
+            if hasattr(candidate, 'safety_ratings'):
+                logger.warning(f"Safety ratings: {candidate.safety_ratings}")
+            return "News Type: General, Misinformation Domain: Other"
+        
+        # Try to extract text
+        if hasattr(candidate.content, 'parts') and candidate.content.parts:
+            return candidate.content.parts[0].text.strip()
+        else:
+            logger.error("No parts in response content")
+            return "News Type: General, Misinformation Domain: Other"
+            
     except Exception as e:
         logger.error(f"Error categorizing with Gemini: {e}")
-        return None
+        return "News Type: General, Misinformation Domain: Other"
 
 async def process_single_news_item(news_item):
     """Process a single news item with proper error handling"""
