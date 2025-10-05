@@ -134,7 +134,7 @@ def get_gemini_model(config: Optional[Dict] = None):
             default_config.update(config)
             
         _local.models[cache_key] = genai.GenerativeModel(
-            model_name="gemini-1.5-pro-latest",
+            model_name="gemini-2.5-flash",
             generation_config=default_config,
         )
     
