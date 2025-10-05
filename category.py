@@ -311,7 +311,7 @@ def get_gemini_model(config=None):
             default_config.update(config)
             
         _local.model = genai.GenerativeModel(
-            model_name="gemini-1.5-pro-latest",
+            model_name="gemini-2.5-flash",
             generation_config=default_config,
         )
     return _local.model
